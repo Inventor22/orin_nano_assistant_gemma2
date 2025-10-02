@@ -1,0 +1,2 @@
+# Ignore all response.wav files anywhere
+**/response.wav

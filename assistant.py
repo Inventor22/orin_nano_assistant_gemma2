@@ -1,14 +1,16 @@
 import whisper, requests, os, sounddevice as sd, numpy as np, tempfile, wave
 import faiss
 from sentence_transformers import SentenceTransformer
+import torch
 
-# Load sentence transformer model for document embeddings
-embedding_model = SentenceTransformer('/home/asier/models')
+# Optimization: Use a more efficient embedding model for Jetson Orin Nano
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Load Whisper model for speech-to-text
-whisper_model = whisper.load_model("tiny")
+# Optimization: Explicitly use CUDA if available, with fallback to CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+whisper_model = whisper.load_model("base").to(device)
 
-# LLaMA server URL for completion (Gemma 2 is running here)
+# Configuration for local LLM server
 llama_url = "http://127.0.0.1:8080/completion"
 
 # Initial prompt to guide the LLaMA model's behavior
@@ -31,17 +33,12 @@ docs = [
 # Vector Database class to handle document embedding and search using FAISS
 class VectorDatabase:
     def __init__(self, dim):
-        # Create FAISS index with specified dimension (384 for SentenceTransformer embeddings)
         self.index = faiss.IndexFlatL2(dim)
         self.documents = []
-    
-    # Add documents and their embeddings to the FAISS index
     def add_documents(self, docs):
-        embeddings = embedding_model.encode(docs)  # Get embeddings for the docs
-        self.index.add(np.array(embeddings, dtype=np.float32))  # Add them to the FAISS index
+        embeddings = embedding_model.encode(docs)
+        self.index.add(np.array(embeddings, dtype=np.float32))
         self.documents.extend(docs)
-    
-    # Search for the top K most relevant documents based on query embedding
     def search(self, query, top_k=3):
         query_embedding = embedding_model.encode([query])[0].astype(np.float32)
         distances, indices = self.index.search(np.array([query_embedding]), top_k)
@@ -51,40 +48,55 @@ class VectorDatabase:
 db = VectorDatabase(dim=384)
 db.add_documents(docs)
 
-# Find the device for audio recording by matching part of the device name
-def find_device(device_name_substring):
-    for i, device in enumerate(sd.query_devices()):
-        if device_name_substring.lower() in device['name'].lower():
-            return i
-    raise ValueError(f"Device with name '{device_name_substring}' not found")
-
 # Play sound (beep) to signal recording start/stop
 def play_sound(sound_file):
     os.system(f"aplay {sound_file}")
 
-# Record audio using sounddevice, save it as a .wav file
-def record_audio(filename, duration=5, fs=16000):
-    sd.default.device = find_device("920")  # Use the audio input device (I have a Logitech 920, that's why, modify as needed)
-    play_sound(bip_sound)  # Start beep
-    audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
-    sd.wait()  # Wait for the recording to complete
+# --- UPDATED: Record at device default rate; let Whisper resample from file ---
+INPUT_DEV = 0  # your USB mic index from sd.query_devices()
+
+def record_audio(filename, duration=5):
+    dinfo = sd.query_devices(INPUT_DEV)
+    fs = int(dinfo["default_samplerate"])  # e.g., 44100 or 48000
+    play_sound(bip_sound)
+    print(f"Recording {duration}s from '{dinfo['name']}' (idx {INPUT_DEV}) at {fs} Hz ...")
+    audio = sd.rec(
+        int(duration * fs),
+        samplerate=fs,
+        channels=1,
+        dtype='float32',   # float32 plays nicest with Whisper/FFmpeg
+        device=INPUT_DEV
+    )
+    sd.wait()
+
+    # Basic level check to catch silence
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64)**2)))
+    print(f"Recorded RMS level: {rms:.1f}")
+
+    # Save exactly as recorded (Whisper/ffmpeg will resample internally)
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setsampwidth(2)  # we'll convert to int16 for the file
         wf.setframerate(fs)
-        wf.writeframes(audio.tobytes())
-    play_sound(bip2_sound)  # End beep
+        wf.writeframes(np.clip(audio * 32768.0, -32768, 32767).astype(np.int16).tobytes())
 
-# Transcribe recorded audio to text using Whisper
+    play_sound(bip2_sound)
+    print("Recording completed")
+
+# Transcribe recorded audio to text using Whisper (it will resample internally)
 def transcribe_audio(filename):
-    return whisper_model.transcribe(filename, language="en")['text']
+    return whisper_model.transcribe(
+        filename,
+        language="en",
+        fp16=(device.type == "cuda")
+    )['text']
 
 # Send a query and context to LLaMA server for completion
 def ask_llama(query, context):
     data = {
         "prompt": f"{initial_prompt}\nContext: {context}\nQuestion: {query}\nAnswer:",
-        "max_tokens": 80,  # Limit response length to avoid delays
-        "temperature": 0.7  # Adjust temperature for balanced responses
+        "max_tokens": 80,
+        "temperature": 0.7
     }
     response = requests.post(llama_url, json=data, headers={'Content-Type': 'application/json'})
     if response.status_code == 200:
@@ -94,25 +106,24 @@ def ask_llama(query, context):
 
 # Generate a response using Retrieval-Augmented Generation (RAG)
 def rag_ask(query):
-    context = " ".join(db.search(query))  # Search for related docs in the FAISS index
-    return ask_llama(query, context)  # Ask LLaMA using the retrieved context
+    context = " ".join(db.search(query))
+    return ask_llama(query, context)
 
 # Convert text to speech using Piper TTS model
 def text_to_speech(text):
-    os.system(f'echo "{text}" | /home/asier/piper/build/piper --model /usr/local/share/piper/models/en-us-lessac-medium.onnx --output_file response.wav && aplay response.wav')
+    os.system(f'echo "{text}" | /home/jetson/Documents/Github/piper/build/piper --model /usr/local/share/piper/models/en_US-lessac-medium.onnx --output_file response.wav && aplay response.wav')
 
 # Main loop for the assistant
 def main():
     while True:
-        # Create a temporary .wav file for the recording
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-            record_audio(tmpfile.name)  # Record the audio input
-            transcribed_text = transcribe_audio(tmpfile.name)  # Convert speech to text
+            record_audio(tmpfile.name)
+            transcribed_text = transcribe_audio(tmpfile.name)
             print(f"Agent heard: {transcribed_text}")
-            response = rag_ask(transcribed_text)  # Generate response using RAG and LLaMA
+            response = rag_ask(transcribed_text)
             print(f"Agent response: {response}")
             if response:
-                text_to_speech(response)  # Convert response to speech
+                text_to_speech(response)
 
 # Entry point of the script
 if __name__ == "__main__":
