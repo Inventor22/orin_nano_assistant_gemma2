@@ -1,2 +1,7 @@
-# Ignore all response.wav files anywhere
-**/response.wav
+# Ignore all .wav files anywhere
+**/*.wav
+
+*.deb
+*.whl
+
+assistant*/

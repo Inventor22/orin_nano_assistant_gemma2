@@ -1,8 +1,8 @@
-whisper
 requests
 sounddevice
 numpy
 faiss-cpu
-sentence-transformers
-TTS
+sentence-transformers>=3.0.1
+openai-whisper
 termcolor
+openwakeword
